@@ -402,6 +402,18 @@ static iree_status_t iree_hal_coralnpu_semaphore_result_from_state(
   }
 }
 
+// Returns true if every semaphore in the list is a CoralNPU semaphore.
+static bool iree_hal_coralnpu_semaphore_list_all_native(
+    const iree_hal_semaphore_list_t semaphore_list) {
+  for (iree_host_size_t i = 0; i < semaphore_list.count; ++i) {
+    if (!iree_hal_resource_is(semaphore_list.semaphores[i],
+                              &iree_hal_coralnpu_semaphore_vtable)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 iree_status_t iree_hal_coralnpu_semaphore_multi_wait(
     iree_hal_coralnpu_semaphore_state_t *shared_state,
     iree_hal_wait_mode_t wait_mode,
@@ -414,6 +426,27 @@ iree_status_t iree_hal_coralnpu_semaphore_multi_wait(
     return iree_hal_semaphore_wait(semaphore_list.semaphores[0],
                                    semaphore_list.payload_values[0], timeout,
                                    flags);
+  }
+
+  // A mixed list (e.g. host + CoralNPU semaphores in a multi-device program)
+  // cannot use the CoralNPU-only notification path below: a foreign semaphore
+  // would fail the type cast and would never wake this notification. Fall back
+  // to per-semaphore waits through the generic HAL semaphore vtable.
+  if (!iree_hal_coralnpu_semaphore_list_all_native(semaphore_list)) {
+    for (iree_host_size_t i = 0; i < semaphore_list.count; ++i) {
+      iree_status_t status = iree_hal_semaphore_wait(
+          semaphore_list.semaphores[i], semaphore_list.payload_values[i],
+          timeout, flags);
+      if (wait_mode == IREE_HAL_WAIT_MODE_ANY) {
+        if (iree_status_is_ok(status)) return iree_ok_status();
+        iree_status_ignore(status);
+      } else {
+        IREE_RETURN_IF_ERROR(status);
+      }
+    }
+    return wait_mode == IREE_HAL_WAIT_MODE_ANY
+               ? iree_status_from_code(IREE_STATUS_DEADLINE_EXCEEDED)
+               : iree_ok_status();
   }
 
   IREE_TRACE_ZONE_BEGIN(z0);

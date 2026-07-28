@@ -3,6 +3,7 @@
 /bazel-coralnpu-compiler
 /bazel-out
 /bazel-testlogs
+/bazel-coralnpu-compiler-exp
 
 /output
 

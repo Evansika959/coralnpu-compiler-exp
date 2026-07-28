@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Xinting Jiang <evansjiang0959@gmail.com>
+Date: Mon, 27 Jul 2026 00:00:00 +0000
+Subject: [PATCH] [HAL] fall back to default memory props when
+ device.optimal devices cannot share memory
+
+A two-device program (host + CoralNPU) creates #hal.device.optimal
+buffers; resolveMemoryPropertiesOp returned failure() when the devices
+cannot share memory, aborting bytecode generation. Fall back to the
+default memory properties (cross-device access via transfers) instead;
+cross-device access is then handled through explicit transfers.
+---
+diff --git a/compiler/src/iree/compiler/Dialect/HAL/Transforms/ResolveTopologyQueries.cpp b/compiler/src/iree/compiler/Dialect/HAL/Transforms/ResolveTopologyQueries.cpp
+index 704634a..9922fdc 100644
+--- a/compiler/src/iree/compiler/Dialect/HAL/Transforms/ResolveTopologyQueries.cpp
++++ b/compiler/src/iree/compiler/Dialect/HAL/Transforms/ResolveTopologyQueries.cpp
+@@ -181,12 +181,13 @@ resolveMemoryPropertiesOp(AllocatorResolveMemoryPropertiesOp op,
+ 
+   LLVM_DEBUG(llvm::dbgs() << "  -> topology attr: " << topologyAttr << "\n");
+ 
+-  // Try to resolve shared usage bits if possible.
+-  if (!tryAddSharedUsageBits(topologyAttr, optimalAttr, bufferUsage,
+-                             memoryTypes, deviceAnalysis, op.getOperation())) {
+-    LLVM_DEBUG(llvm::dbgs() << "  -> failed to add shared usage bits\n");
+-    return failure();
+-  }
++  // Try to resolve shared usage bits if possible. When the devices in the
++  // optimal set cannot share memory (no transparent access / no topology, e.g.
++  // a host device paired with the CoralNPU device), fall back to the default
++  // memory properties instead of failing; cross-device access is then handled
++  // through explicit transfers rather than shared mappings.
++  (void)tryAddSharedUsageBits(topologyAttr, optimalAttr, bufferUsage,
++                              memoryTypes, deviceAnalysis, op.getOperation());
+ 
+   LLVM_DEBUG(llvm::dbgs() << "  -> successfully resolved memory properties "
+                              "with shared usage bits\n");

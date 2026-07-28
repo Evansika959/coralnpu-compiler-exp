@@ -32,8 +32,12 @@ namespace mlir::coralnpu_compiler {
 namespace {
 
 bool isSupportedComputeOp(Operation *op) {
-  if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, linalg::Mmt4DOp>(op))
-    return true;
+  // NB: batch_matmul (attention Q@K^T and P@V) is intentionally excluded so it
+  // stays on the host alongside softmax. Otherwise softmax -- which sits between
+  // the two attention batch_matmuls -- gets pulled onto CoralNPU by the affinity
+  // solver (to avoid transfers), and its ~6KB kernel plus libm helpers overflow
+  // the 8KB ITCM.
+  if (isa<linalg::MatmulOp, linalg::Mmt4DOp>(op)) return true;
 
   if (isa<linalg::Conv2DNhwcHwcfOp>(op)) return true;
 
@@ -126,6 +130,30 @@ IREE::HAL::DeviceAffinityAttr getCoralNPUDeviceAffinityAttr(
 
   return nullptr;
 }
+
+// Discover the host (non-CoralNPU) device alias, so we can explicitly pin ops
+// there.
+IREE::HAL::DeviceAffinityAttr getHostDeviceAffinityAttr(MLIRContext *context,
+                                                        ModuleOp moduleOp) {
+  IREE::HAL::DeviceAnalysis deviceAnalysis(moduleOp);
+  if (failed(deviceAnalysis.run())) {
+    return nullptr;
+  }
+
+  for (auto globalOp : deviceAnalysis.getDeviceGlobals()) {
+    auto deviceSet = deviceAnalysis.lookupDeviceTargets(globalOp);
+    if (!deviceSet) continue;
+    for (auto targetAttr : deviceSet->getValues()) {
+      if (targetAttr.getDeviceID().getValue() != "coralnpu") {
+        return IREE::HAL::DeviceAffinityAttr::get(
+            context, SymbolRefAttr::get(globalOp.getGlobalName()),
+            /*queue_mask=*/-1ll);
+      }
+    }
+  }
+
+  return nullptr;
+}
 struct CoralNPUAffinityAnnotationPass
     : public impl::CoralNPUAffinityAnnotationBase<
           CoralNPUAffinityAnnotationPass> {
@@ -154,13 +182,28 @@ struct CoralNPUAffinityAnnotationPass
         getCoralNPUDeviceAffinityAttr(context, moduleOp);
     if (!coralnpuAffinityAttr) return;
 
-    // TODO: decide which operations should execute on coralnpu
+    // Host device, used to explicitly pin non-CoralNPU compute so the stream
+    // affinity solver does not consolidate everything onto CoralNPU (which would
+    // pull softmax/elementwise/reduction kernels into the tiny 8KB ITCM
+    // executable).
+    iree_compiler::IREE::HAL::DeviceAffinityAttr hostAffinityAttr =
+        getHostDeviceAffinityAttr(context, moduleOp);
+
     moduleOp.walk([&](Operation *op) {
       // If op already has affinity, don't change it
       if (op->getAttr("stream.affinity")) return;
 
-      if (shouldExecuteOnCoralNPU(op))
+      if (shouldExecuteOnCoralNPU(op)) {
         op->setAttr("stream.affinity", coralnpuAffinityAttr);
+      } else if (hostAffinityAttr &&
+                 (isa<linalg::LinalgOp>(op) || isa<linalg::SoftmaxOp>(op)) &&
+                 !isa<linalg::FillOp>(op)) {
+        // Keep every other compute kernel (softmax, gelu, layernorm, residual
+        // adds, transpose, ...) on the host so only matmuls land on CoralNPU.
+        // linalg.softmax is a structured op that does not implement LinalgOp,
+        // so it must be matched explicitly.
+        op->setAttr("stream.affinity", hostAffinityAttr);
+      }
     });
   }
 };
